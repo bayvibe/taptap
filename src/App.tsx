@@ -4,7 +4,7 @@ import type { CSSProperties } from "react";
 import drumPadSrc from "./assets/drum-pad-cutout.webp";
 
 type Quality = "perfect" | "fast" | "slow";
-type QuizState = "idle" | "countdown" | "listen" | "active" | "done";
+type QuizState = "idle" | "countdown" | "listen" | "prep" | "active" | "done";
 type SettingPanel = "bpm" | "signature" | null;
 
 type PracticeConfig = {
@@ -58,7 +58,7 @@ const SIGNATURE_OPTIONS = [
   { label: "7/8", beats: 7, unit: 8 },
 ];
 
-const QUIZ_BEATS = 12;
+const QUIZ_MEASURES = 5;
 const COUNTDOWN_SECONDS = 3;
 const IDLE_HINT_MS = 5000;
 const FULL_SCORE_TOLERANCE_MS = 35;
@@ -80,6 +80,8 @@ const toleranceFor = (bpm: number) => {
   const durationMs = beatDuration(bpm) * 1000;
   return clamp(durationMs * 0.18, 90, 170);
 };
+
+const quizBeatCount = (config: PracticeConfig) => config.beatsPerMeasure * QUIZ_MEASURES;
 
 const getBeatProfile = (beatIndex: number, config: PracticeConfig) => {
   const measureIndex = Math.floor(beatIndex / config.beatsPerMeasure);
@@ -278,6 +280,7 @@ export default function App() {
   );
   const quizStateRef = useRef<QuizState>("idle");
   const quizListenEndBeatRef = useRef(0);
+  const quizPrepEndBeatRef = useRef(0);
   const quizStartBeatRef = useRef(0);
   const quizEndBeatRef = useRef(0);
   const quizTapsRef = useRef<TapRecord[]>([]);
@@ -326,6 +329,7 @@ export default function App() {
 
   const cancelQuiz = useCallback(() => {
     quizListenEndBeatRef.current = 0;
+    quizPrepEndBeatRef.current = 0;
     quizStartBeatRef.current = 0;
     quizEndBeatRef.current = 0;
     quizTapsRef.current = [];
@@ -429,7 +433,7 @@ export default function App() {
     const firstQuizBeat = startBeat ?? Math.floor((now - sessionStartRef.current) / duration) + 1;
 
     quizStartBeatRef.current = firstQuizBeat;
-    quizEndBeatRef.current = firstQuizBeat + QUIZ_BEATS;
+    quizEndBeatRef.current = firstQuizBeat + quizBeatCount(currentConfig);
     quizTapsRef.current = [];
     setQuizTapCount(0);
     setQuizProgress(0);
@@ -443,6 +447,7 @@ export default function App() {
 
     resetTimeline();
     quizListenEndBeatRef.current = currentConfig.beatsPerMeasure;
+    quizPrepEndBeatRef.current = currentConfig.beatsPerMeasure * 2;
     quizStartBeatRef.current = 0;
     quizEndBeatRef.current = 0;
     quizTapsRef.current = [];
@@ -459,7 +464,7 @@ export default function App() {
     const result = analyzeQuiz(
       quizTapsRef.current,
       quizStartBeatRef.current,
-      QUIZ_BEATS,
+      quizBeatCount(currentConfig),
       currentConfig,
     );
 
@@ -472,6 +477,7 @@ export default function App() {
     void unlockAudio();
     resetIdleHint();
     quizListenEndBeatRef.current = 0;
+    quizPrepEndBeatRef.current = 0;
     quizStartBeatRef.current = 0;
     quizEndBeatRef.current = 0;
     quizTapsRef.current = [];
@@ -489,11 +495,20 @@ export default function App() {
     const currentConfig = configRef.current;
     if (!currentConfig) return;
 
-    if (quizStateRef.current === "countdown" || quizStateRef.current === "listen") {
+    if (
+      quizStateRef.current === "countdown" ||
+      quizStateRef.current === "listen" ||
+      quizStateRef.current === "prep"
+    ) {
       const waitBubble: TapBubble = {
         id: `wait-${Date.now()}`,
         quality: "slow",
-        label: quizStateRef.current === "listen" ? "先听" : "等等",
+        label:
+          quizStateRef.current === "countdown"
+            ? "等等"
+            : quizStateRef.current === "prep"
+              ? "预备"
+              : "先听",
       };
       setTapBubbles((current) => [...current.slice(-2), waitBubble]);
       window.setTimeout(() => {
@@ -649,15 +664,31 @@ export default function App() {
     setQuizProgress(listenProgress);
 
     if (quizListenEndBeatRef.current > 0 && clock.beatIndex >= quizListenEndBeatRef.current) {
-      activateQuiz(quizListenEndBeatRef.current);
+      setQuizState("prep");
+    }
+  }, [clock.beatIndex, clock.progress, quizState]);
+
+  useEffect(() => {
+    if (quizState !== "prep") return;
+
+    const prepEndBeat = Math.max(1, quizPrepEndBeatRef.current);
+    const prepProgress = clamp((clock.beatIndex + clock.progress) / prepEndBeat, 0, 1);
+    setQuizProgress(prepProgress);
+
+    if (quizPrepEndBeatRef.current > 0 && clock.beatIndex >= quizPrepEndBeatRef.current) {
+      activateQuiz(quizPrepEndBeatRef.current);
     }
   }, [activateQuiz, clock.beatIndex, clock.progress, quizState]);
 
   useEffect(() => {
     if (quizState !== "active") return;
 
-    const completedBeats = clamp(clock.beatIndex - quizStartBeatRef.current + 1, 0, QUIZ_BEATS);
-    setQuizProgress(completedBeats / QUIZ_BEATS);
+    const currentConfig = configRef.current;
+    if (!currentConfig) return;
+
+    const expectedBeats = quizBeatCount(currentConfig);
+    const completedBeats = clamp(clock.beatIndex - quizStartBeatRef.current + 1, 0, expectedBeats);
+    setQuizProgress(completedBeats / expectedBeats);
 
     if (quizEndBeatRef.current > 0 && clock.beatIndex >= quizEndBeatRef.current) {
       finishQuiz();
@@ -675,10 +706,14 @@ export default function App() {
   const signatureValue = `${beatsPerMeasure}/${beatUnit}`;
   const beatDots = Array.from({ length: beatsPerMeasure }, (_, index) => index);
   const currentMeasureLabel = silentAlternate ? "开" : "关";
-  const drumLocked = quizState === "listen" || quizState === "countdown";
+  const expectedQuizBeats = quizBeatCount(config);
+  const quizVisualHidden = quizState === "prep" || quizState === "active";
+  const drumLocked = quizState === "listen" || quizState === "prep" || quizState === "countdown";
   const quizButtonLabel =
     quizState === "active"
       ? "测验中"
+      : quizState === "prep"
+        ? "预备"
       : quizState === "listen"
         ? "听一遍"
         : quizState === "countdown"
@@ -758,9 +793,9 @@ export default function App() {
 
       <section className="beat-panel" aria-label="节拍跟打">
         <div
-          className={`beat-dots ${quizState === "active" ? "is-hidden" : ""}`}
+          className={`beat-dots ${quizVisualHidden ? "is-hidden" : ""}`}
           aria-label="当前小节拍点"
-          aria-hidden={quizState === "active"}
+          aria-hidden={quizVisualHidden}
           style={{ "--beat-count": beatsPerMeasure } as CSSProperties}
         >
           {beatDots.map((dot) => {
@@ -779,7 +814,9 @@ export default function App() {
           onPointerDown={registerTap}
         >
           <img src={drumPadSrc} alt="" draggable={false} />
-          {quizState === "listen" && <span className="listen-hint">先听一遍</span>}
+          {(quizState === "listen" || quizState === "prep") && (
+            <span className="listen-hint">{quizState === "prep" ? "预备拍" : "先听一遍"}</span>
+          )}
           {showIdleHint && !drumLocked && <span className="tap-hint">tap tap</span>}
           {tapBubbles.map((bubble) => (
             <span className={`tap-bubble ${bubble.quality}`} key={bubble.id}>
@@ -796,7 +833,9 @@ export default function App() {
         <div className="quiz-heading">
           <div>
             <p>测验</p>
-            <strong>{QUIZ_BEATS} 拍</strong>
+            <strong>
+              {QUIZ_MEASURES} 小节 · {expectedQuizBeats} 拍
+            </strong>
           </div>
           <Timer size={21} />
         </div>
@@ -804,7 +843,12 @@ export default function App() {
         <button
           className="quiz-button"
           type="button"
-          disabled={quizState === "active" || quizState === "countdown" || quizState === "listen"}
+          disabled={
+            quizState === "active" ||
+            quizState === "countdown" ||
+            quizState === "listen" ||
+            quizState === "prep"
+          }
           onClick={quizState === "done" ? startQuiz : startQuiz}
         >
           {quizButtonLabel}
@@ -822,7 +866,9 @@ export default function App() {
           {quizState === "countdown"
             ? "准备"
             : quizState === "listen"
-              ? "听完这一小节再敲"
+              ? "听完这一小节"
+            : quizState === "prep"
+              ? "预备拍不计分，下一小节开始"
             : quizState === "active"
               ? `点击 ${quizTapCount}`
               : quizState === "done"
