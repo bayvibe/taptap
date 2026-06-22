@@ -1,0 +1,856 @@
+import { RotateCcw, Timer } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
+import drumPadSrc from "./assets/drum-pad-cutout.webp";
+
+type Quality = "perfect" | "fast" | "slow";
+type QuizState = "idle" | "countdown" | "listen" | "active" | "done";
+type SettingPanel = "bpm" | "signature" | null;
+
+type PracticeConfig = {
+  bpm: number;
+  beatsPerMeasure: number;
+  beatUnit: number;
+  silentAlternate: boolean;
+};
+
+type ClockState = {
+  beatIndex: number;
+  beatInMeasure: number;
+  measureIndex: number;
+  progress: number;
+  audible: boolean;
+};
+
+type TapRecord = {
+  id: string;
+  targetIndex: number;
+  errorMs: number;
+  quality: Quality;
+};
+
+type TapBubble = {
+  id: string;
+  quality: Quality;
+  label: string;
+};
+
+type TipCopy = {
+  quality: Quality;
+  title: string;
+  detail: string;
+};
+
+type QuizResult = {
+  accuracy: number;
+  hits: number;
+  expected: number;
+  averageErrorMs: number | null;
+};
+
+const SIGNATURE_OPTIONS = [
+  { label: "1/4", beats: 1, unit: 4 },
+  { label: "2/4", beats: 2, unit: 4 },
+  { label: "3/4", beats: 3, unit: 4 },
+  { label: "4/4", beats: 4, unit: 4 },
+  { label: "5/4", beats: 5, unit: 4 },
+  { label: "6/8", beats: 6, unit: 8 },
+  { label: "7/8", beats: 7, unit: 8 },
+];
+
+const QUIZ_BEATS = 12;
+const COUNTDOWN_SECONDS = 3;
+const IDLE_HINT_MS = 5000;
+
+const INITIAL_CLOCK: ClockState = {
+  beatIndex: 0,
+  beatInMeasure: 0,
+  measureIndex: 0,
+  progress: 0,
+  audible: true,
+};
+
+const clamp = (value: number, min: number, max: number) =>
+  Math.min(Math.max(value, min), max);
+
+const beatDuration = (bpm: number) => 60 / bpm;
+
+const toleranceFor = (bpm: number) => {
+  const durationMs = beatDuration(bpm) * 1000;
+  return clamp(durationMs * 0.18, 90, 170);
+};
+
+const getBeatProfile = (beatIndex: number, config: PracticeConfig) => {
+  const measureIndex = Math.floor(beatIndex / config.beatsPerMeasure);
+  const beatInMeasure = beatIndex % config.beatsPerMeasure;
+  const audible = !config.silentAlternate || measureIndex % 2 === 0;
+
+  return {
+    measureIndex,
+    beatInMeasure,
+    audible,
+  };
+};
+
+const playClick = (context: AudioContext, time: number, volume: number, accented = false) => {
+  const duration = accented ? 0.058 : 0.046;
+  const sampleRate = context.sampleRate;
+  const frameCount = Math.max(1, Math.floor(sampleRate * duration));
+  const buffer = context.createBuffer(1, frameCount, sampleRate);
+  const data = buffer.getChannelData(0);
+  const source = context.createBufferSource();
+  const gain = context.createGain();
+  const woodFrequency = accented ? 1180 : 1420;
+  const bodyFrequency = accented ? 520 : 720;
+  const edgeFrequency = accented ? 2360 : 2840;
+
+  for (let index = 0; index < frameCount; index += 1) {
+    const t = index / sampleRate;
+    const attack = clamp(t / 0.0018, 0, 1);
+    const bodyEnvelope = Math.exp(-t * (accented ? 86 : 112));
+    const woodEnvelope = Math.exp(-t * 155);
+    const edgeEnvelope = Math.exp(-t * 240);
+    const strikeEnvelope = Math.exp(-t * 460);
+    const noise = Math.sin(index * 91.7 + 0.37) * Math.sin(index * 17.13 + 1.9);
+    const body = Math.sin(2 * Math.PI * bodyFrequency * t) * (accented ? 0.34 : 0.18) * bodyEnvelope;
+    const wood = Math.sin(2 * Math.PI * woodFrequency * t) * 0.68 * woodEnvelope;
+    const edge = Math.sin(2 * Math.PI * edgeFrequency * t) * 0.16 * edgeEnvelope;
+    const strike = noise * (accented ? 0.12 : 0.09) * strikeEnvelope;
+
+    data[index] = (body + wood + edge + strike) * attack;
+  }
+
+  source.buffer = buffer;
+  gain.gain.setValueAtTime(volume * (accented ? 0.7 : 0.54), time);
+
+  source.connect(gain);
+  gain.connect(context.destination);
+  source.start(time);
+  source.stop(time + duration);
+
+  return source;
+};
+
+const classifyTap = (errorMs: number): Quality => {
+  if (Math.abs(errorMs) <= 55) return "perfect";
+  return errorMs < 0 ? "fast" : "slow";
+};
+
+const makeTip = (errorMs: number): TipCopy => {
+  const absolute = Math.round(Math.abs(errorMs));
+
+  if (Math.abs(errorMs) <= 55) {
+    return {
+      quality: "perfect",
+      title: "准",
+      detail: "贴住拍点",
+    };
+  }
+
+  if (errorMs < 0) {
+    return {
+      quality: "fast",
+      title: "快了",
+      detail: `${absolute} ms`,
+    };
+  }
+
+  return {
+    quality: "slow",
+    title: "慢了",
+    detail: `${absolute} ms`,
+  };
+};
+
+const formatMs = (value: number | null) => {
+  if (value === null) return "0 ms";
+  const rounded = Math.round(value);
+  if (rounded === 0) return "0 ms";
+  return `${rounded > 0 ? "+" : ""}${rounded} ms`;
+};
+
+const getQuizResultCopy = (result: QuizResult) => {
+  if (result.accuracy >= 90) {
+    return {
+      badge: "稳到发光",
+      title: "这拍子被你拿捏住了",
+      body: "手感很在线，像是节拍已经住进手腕里。下一轮可以稍微加一点 BPM。",
+    };
+  }
+
+  if (result.accuracy >= 70) {
+    return {
+      badge: "节奏上线",
+      title: "很不错，已经跟上主脉搏了",
+      body: "有几拍还在找位置，但整体很有方向。再听一遍重拍，下一轮会更稳。",
+    };
+  }
+
+  if (result.accuracy >= 45) {
+    return {
+      badge: "正在校准",
+      title: "别急，节拍感正在长出来",
+      body: "先别追求全中，盯住第一拍和最后一拍。身体记住以后，中间会自己排队。",
+    };
+  }
+
+  return {
+    badge: "重新蓄力",
+    title: "这一轮是热身，不算输",
+    body: "建议把 BPM 降一点，只敲强拍也可以。稳住一个点，比乱追十二个点更有用。",
+  };
+};
+
+const analyzeQuiz = (
+  taps: TapRecord[],
+  startBeat: number,
+  expected: number,
+  config: PracticeConfig,
+): QuizResult => {
+  const tolerance = toleranceFor(config.bpm);
+  const bestByTarget = new Map<number, TapRecord>();
+
+  taps.forEach((tap) => {
+    if (tap.targetIndex < startBeat || tap.targetIndex >= startBeat + expected) return;
+
+    const existing = bestByTarget.get(tap.targetIndex);
+    if (!existing || Math.abs(tap.errorMs) < Math.abs(existing.errorMs)) {
+      bestByTarget.set(tap.targetIndex, tap);
+    }
+  });
+
+  const bestTaps = Array.from(bestByTarget.values());
+  const hits = bestTaps.filter((tap) => Math.abs(tap.errorMs) <= tolerance);
+  const averageErrorMs = bestTaps.length
+    ? bestTaps.reduce((sum, tap) => sum + tap.errorMs, 0) / bestTaps.length
+    : null;
+
+  return {
+    accuracy: Math.round((hits.length / expected) * 100),
+    hits: hits.length,
+    expected,
+    averageErrorMs,
+  };
+};
+
+export default function App() {
+  const [bpm, setBpm] = useState(60);
+  const [beatsPerMeasure, setBeatsPerMeasure] = useState(4);
+  const [beatUnit, setBeatUnit] = useState(4);
+  const [silentAlternate, setSilentAlternate] = useState(false);
+  const [clock, setClock] = useState<ClockState>(INITIAL_CLOCK);
+  const [tapBubbles, setTapBubbles] = useState<TapBubble[]>([]);
+  const [tapPulseId, setTapPulseId] = useState<string | null>(null);
+  const [audioReady, setAudioReady] = useState(false);
+  const [showIdleHint, setShowIdleHint] = useState(false);
+  const [activeSetting, setActiveSetting] = useState<SettingPanel>(null);
+  const [quizState, setQuizState] = useState<QuizState>("idle");
+  const [countdown, setCountdown] = useState(COUNTDOWN_SECONDS);
+  const [quizProgress, setQuizProgress] = useState(0);
+  const [quizTapCount, setQuizTapCount] = useState(0);
+  const [quizResult, setQuizResult] = useState<QuizResult | null>(null);
+
+  const audioRef = useRef<AudioContext | null>(null);
+  const schedulerRef = useRef<number | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const nextBeatIndexRef = useRef(0);
+  const sessionStartRef = useRef(0);
+  const configRef = useRef<PracticeConfig | null>(null);
+  const volumeRef = useRef(0.68);
+  const idleTimerRef = useRef<number | null>(null);
+  const scheduledClicksRef = useRef<AudioScheduledSourceNode[]>([]);
+  const pageAudibleRef = useRef(
+    typeof document === "undefined" ? true : document.visibilityState === "visible",
+  );
+  const quizStateRef = useRef<QuizState>("idle");
+  const quizListenEndBeatRef = useRef(0);
+  const quizStartBeatRef = useRef(0);
+  const quizEndBeatRef = useRef(0);
+  const quizTapsRef = useRef<TapRecord[]>([]);
+
+  const config = useMemo<PracticeConfig>(
+    () => ({
+      bpm,
+      beatsPerMeasure,
+      beatUnit,
+      silentAlternate,
+    }),
+    [bpm, beatsPerMeasure, beatUnit, silentAlternate],
+  );
+
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
+
+  useEffect(() => {
+    quizStateRef.current = quizState;
+  }, [quizState]);
+
+  const unlockAudio = useCallback(async () => {
+    const AudioContextCtor =
+      window.AudioContext ||
+      (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
+    if (!AudioContextCtor) return false;
+
+    if (!audioRef.current) {
+      audioRef.current = new AudioContextCtor();
+    }
+
+    try {
+      if (audioRef.current.state !== "running") {
+        await audioRef.current.resume();
+      }
+      const running = audioRef.current.state === "running";
+      setAudioReady(running);
+      return running;
+    } catch {
+      setAudioReady(false);
+      return false;
+    }
+  }, []);
+
+  const cancelQuiz = useCallback(() => {
+    quizListenEndBeatRef.current = 0;
+    quizStartBeatRef.current = 0;
+    quizEndBeatRef.current = 0;
+    quizTapsRef.current = [];
+    setQuizTapCount(0);
+    setQuizProgress(0);
+    setCountdown(COUNTDOWN_SECONDS);
+    setQuizResult(null);
+    setQuizState("idle");
+  }, []);
+
+  const resetIdleHint = useCallback(() => {
+    setShowIdleHint(false);
+
+    if (idleTimerRef.current !== null) {
+      window.clearTimeout(idleTimerRef.current);
+    }
+
+    idleTimerRef.current = window.setTimeout(() => {
+      setShowIdleHint(true);
+    }, IDLE_HINT_MS);
+  }, []);
+
+  const clearScheduledClicks = useCallback(() => {
+    scheduledClicksRef.current.forEach((source) => {
+      try {
+        source.stop();
+      } catch {
+        // Already stopped or already ended.
+      }
+    });
+    scheduledClicksRef.current = [];
+  }, []);
+
+  const resetTimeline = useCallback(() => {
+    clearScheduledClicks();
+    sessionStartRef.current = performance.now() / 1000;
+    nextBeatIndexRef.current = 0;
+    setClock(INITIAL_CLOCK);
+  }, [clearScheduledClicks]);
+
+  const runScheduler = useCallback(() => {
+    const context = audioRef.current;
+    const currentConfig = configRef.current;
+    if (!pageAudibleRef.current || !context || !currentConfig || context.state !== "running") return;
+
+    const duration = beatDuration(currentConfig.bpm);
+    const wallNow = performance.now() / 1000;
+    const currentBeatFloat = (wallNow - sessionStartRef.current) / duration;
+    const firstSchedulableBeat = Math.max(0, Math.ceil(currentBeatFloat - 0.03));
+    const beatsAhead = Math.max(2, Math.ceil(0.16 / duration) + 1);
+
+    if (nextBeatIndexRef.current < firstSchedulableBeat) {
+      nextBeatIndexRef.current = firstSchedulableBeat;
+    }
+
+    while (nextBeatIndexRef.current <= firstSchedulableBeat + beatsAhead) {
+      const profile = getBeatProfile(nextBeatIndexRef.current, currentConfig);
+
+      if (profile.audible) {
+        const targetWallTime = sessionStartRef.current + nextBeatIndexRef.current * duration;
+        const secondsUntilBeat = targetWallTime - wallNow;
+        const audioTime = context.currentTime + Math.max(0.012, secondsUntilBeat);
+        const source = playClick(context, audioTime, volumeRef.current, profile.beatInMeasure === 0);
+        scheduledClicksRef.current.push(source);
+        source.onended = () => {
+          scheduledClicksRef.current = scheduledClicksRef.current.filter((item) => item !== source);
+        };
+      }
+
+      nextBeatIndexRef.current += 1;
+    }
+  }, []);
+
+  const updateClock = useCallback(() => {
+    const currentConfig = configRef.current;
+    if (!currentConfig) return;
+
+    const duration = beatDuration(currentConfig.bpm);
+    const elapsed = Math.max(0, performance.now() / 1000 - sessionStartRef.current);
+    const beatIndex = Math.max(0, Math.floor(elapsed / duration));
+    const profile = getBeatProfile(beatIndex, currentConfig);
+    const progress = clamp((elapsed - beatIndex * duration) / duration, 0, 1);
+
+    setClock({
+      beatIndex,
+      beatInMeasure: profile.beatInMeasure,
+      measureIndex: profile.measureIndex,
+      progress,
+      audible: profile.audible,
+    });
+
+    rafRef.current = window.requestAnimationFrame(updateClock);
+  }, []);
+
+  const activateQuiz = useCallback((startBeat?: number) => {
+    const currentConfig = configRef.current;
+    if (!currentConfig) return;
+
+    const now = performance.now() / 1000;
+    const duration = beatDuration(currentConfig.bpm);
+    const firstQuizBeat = startBeat ?? Math.floor((now - sessionStartRef.current) / duration) + 1;
+
+    quizStartBeatRef.current = firstQuizBeat;
+    quizEndBeatRef.current = firstQuizBeat + QUIZ_BEATS;
+    quizTapsRef.current = [];
+    setQuizTapCount(0);
+    setQuizProgress(0);
+    setQuizResult(null);
+    setQuizState("active");
+  }, []);
+
+  const startQuizListen = useCallback(() => {
+    const currentConfig = configRef.current;
+    if (!currentConfig) return;
+
+    resetTimeline();
+    quizListenEndBeatRef.current = currentConfig.beatsPerMeasure;
+    quizStartBeatRef.current = 0;
+    quizEndBeatRef.current = 0;
+    quizTapsRef.current = [];
+    setQuizTapCount(0);
+    setQuizProgress(0);
+    setQuizResult(null);
+    setQuizState("listen");
+  }, [resetTimeline]);
+
+  const finishQuiz = useCallback(() => {
+    const currentConfig = configRef.current;
+    if (!currentConfig || quizStateRef.current !== "active") return;
+
+    const result = analyzeQuiz(
+      quizTapsRef.current,
+      quizStartBeatRef.current,
+      QUIZ_BEATS,
+      currentConfig,
+    );
+
+    setQuizResult(result);
+    setQuizProgress(1);
+    setQuizState("done");
+  }, []);
+
+  const startQuiz = useCallback(() => {
+    void unlockAudio();
+    resetIdleHint();
+    quizListenEndBeatRef.current = 0;
+    quizStartBeatRef.current = 0;
+    quizEndBeatRef.current = 0;
+    quizTapsRef.current = [];
+    setQuizTapCount(0);
+    setQuizProgress(0);
+    setQuizResult(null);
+    setCountdown(COUNTDOWN_SECONDS);
+    setQuizState("countdown");
+  }, [resetIdleHint, unlockAudio]);
+
+  const registerTap = useCallback(() => {
+    void unlockAudio();
+    resetIdleHint();
+
+    const currentConfig = configRef.current;
+    if (!currentConfig) return;
+
+    if (quizStateRef.current === "countdown" || quizStateRef.current === "listen") {
+      const waitBubble: TapBubble = {
+        id: `wait-${Date.now()}`,
+        quality: "slow",
+        label: quizStateRef.current === "listen" ? "先听" : "等等",
+      };
+      setTapBubbles((current) => [...current.slice(-2), waitBubble]);
+      window.setTimeout(() => {
+        setTapBubbles((current) => current.filter((item) => item.id !== waitBubble.id));
+      }, 1800);
+      return;
+    }
+
+    const duration = beatDuration(currentConfig.bpm);
+    const now = performance.now() / 1000;
+    const rawIndex = (now - sessionStartRef.current) / duration;
+    const targetIndex = Math.round(rawIndex);
+
+    if (targetIndex < 0) return;
+
+    const targetTime = sessionStartRef.current + targetIndex * duration;
+    const errorMs = (now - targetTime) * 1000;
+    const quality = classifyTap(errorMs);
+    const record: TapRecord = {
+      id: `${Date.now()}-${Math.round(Math.random() * 100000)}`,
+      targetIndex,
+      errorMs,
+      quality,
+    };
+    const nextTip = makeTip(errorMs);
+    const bubble: TapBubble = {
+      id: record.id,
+      quality,
+      label: nextTip.quality === "perfect" ? nextTip.title : `${nextTip.title} ${nextTip.detail}`,
+    };
+
+    setTapBubbles((current) => [...current.slice(-2), bubble]);
+    setTapPulseId(record.id);
+    window.setTimeout(() => {
+      setTapPulseId((current) => (current === record.id ? null : current));
+    }, 170);
+    window.setTimeout(() => {
+      setTapBubbles((current) => current.filter((item) => item.id !== bubble.id));
+    }, 1800);
+
+    if (
+      quizStateRef.current === "active" &&
+      targetIndex >= quizStartBeatRef.current &&
+      targetIndex < quizEndBeatRef.current
+    ) {
+      quizTapsRef.current = [...quizTapsRef.current, record];
+      setQuizTapCount(quizTapsRef.current.length);
+    }
+  }, [resetIdleHint, unlockAudio]);
+
+  useEffect(() => {
+    resetTimeline();
+    void unlockAudio();
+    resetIdleHint();
+
+    schedulerRef.current = window.setInterval(runScheduler, 25);
+    rafRef.current = window.requestAnimationFrame(updateClock);
+
+    return () => {
+      if (schedulerRef.current !== null) {
+        window.clearInterval(schedulerRef.current);
+        schedulerRef.current = null;
+      }
+
+      if (rafRef.current !== null) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+
+      if (idleTimerRef.current !== null) {
+        window.clearTimeout(idleTimerRef.current);
+      }
+
+      clearScheduledClicks();
+    };
+  }, [clearScheduledClicks, resetIdleHint, resetTimeline, runScheduler, unlockAudio, updateClock]);
+
+  useEffect(() => {
+    const setPageAudible = (audible: boolean) => {
+      if (pageAudibleRef.current === audible) return;
+
+      pageAudibleRef.current = audible;
+
+      if (!audible) {
+        clearScheduledClicks();
+        return;
+      }
+
+      void unlockAudio();
+    };
+
+    const syncPageAudibility = () => {
+      setPageAudible(document.visibilityState === "visible" && document.hasFocus());
+    };
+    const mutePage = () => setPageAudible(false);
+
+    syncPageAudibility();
+    document.addEventListener("visibilitychange", syncPageAudibility);
+    window.addEventListener("focus", syncPageAudibility);
+    window.addEventListener("blur", mutePage);
+    window.addEventListener("pagehide", mutePage);
+
+    return () => {
+      document.removeEventListener("visibilitychange", syncPageAudibility);
+      window.removeEventListener("focus", syncPageAudibility);
+      window.removeEventListener("blur", mutePage);
+      window.removeEventListener("pagehide", mutePage);
+    };
+  }, [clearScheduledClicks, unlockAudio]);
+
+  useEffect(() => {
+    resetTimeline();
+    if (quizStateRef.current !== "idle") {
+      cancelQuiz();
+    }
+  }, [bpm, beatsPerMeasure, beatUnit, silentAlternate, resetTimeline, cancelQuiz]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const editing = target?.closest("input, select, textarea, [contenteditable='true']");
+
+      if (event.code === "Space" && !editing) {
+        event.preventDefault();
+        registerTap();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [registerTap]);
+
+  useEffect(() => {
+    if (quizState !== "countdown") return;
+
+    if (countdown <= 0) {
+      startQuizListen();
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setCountdown((current) => current - 1);
+    }, 1000);
+
+    return () => window.clearTimeout(timeout);
+  }, [countdown, quizState, startQuizListen]);
+
+  useEffect(() => {
+    if (quizState !== "listen") return;
+
+    const listenBeats = Math.max(1, quizListenEndBeatRef.current);
+    const listenProgress = clamp((clock.beatIndex + clock.progress) / listenBeats, 0, 1);
+    setQuizProgress(listenProgress);
+
+    if (quizListenEndBeatRef.current > 0 && clock.beatIndex >= quizListenEndBeatRef.current) {
+      activateQuiz(quizListenEndBeatRef.current);
+    }
+  }, [activateQuiz, clock.beatIndex, clock.progress, quizState]);
+
+  useEffect(() => {
+    if (quizState !== "active") return;
+
+    const completedBeats = clamp(clock.beatIndex - quizStartBeatRef.current + 1, 0, QUIZ_BEATS);
+    setQuizProgress(completedBeats / QUIZ_BEATS);
+
+    if (quizEndBeatRef.current > 0 && clock.beatIndex >= quizEndBeatRef.current) {
+      finishQuiz();
+    }
+  }, [clock.beatIndex, finishQuiz, quizState]);
+
+  const updateSignature = (value: string) => {
+    const [beats, unit] = value.split("/").map(Number);
+    resetTimeline();
+    setBeatsPerMeasure(beats);
+    setBeatUnit(unit);
+    setActiveSetting(null);
+  };
+
+  const clearResult = () => {
+    setQuizResult(null);
+    cancelQuiz();
+  };
+
+  const signatureValue = `${beatsPerMeasure}/${beatUnit}`;
+  const beatDots = Array.from({ length: beatsPerMeasure }, (_, index) => index);
+  const currentMeasureLabel = silentAlternate ? "开" : "关";
+  const drumLocked = quizState === "listen" || quizState === "countdown";
+  const quizButtonLabel =
+    quizState === "active"
+      ? "测验中"
+      : quizState === "listen"
+        ? "听一遍"
+        : quizState === "countdown"
+        ? "倒计时"
+        : quizState === "done"
+          ? "再测一次"
+          : "开始测验";
+  const quizResultCopy = quizResult ? getQuizResultCopy(quizResult) : null;
+
+  return (
+    <main className="mobile-shell">
+      <section className="status-hero" aria-label="当前节拍状态">
+        <p>拍感练习</p>
+        <div className="status-grid">
+          <button
+            className={activeSetting === "bpm" ? "is-editing" : ""}
+            type="button"
+            onClick={() => setActiveSetting((current) => (current === "bpm" ? null : "bpm"))}
+          >
+            <span>BPM</span>
+            <strong>{bpm}</strong>
+          </button>
+          <button
+            className={activeSetting === "signature" ? "is-editing" : ""}
+            type="button"
+            onClick={() =>
+              setActiveSetting((current) => (current === "signature" ? null : "signature"))
+            }
+          >
+            <span>拍号</span>
+            <strong>{signatureValue}</strong>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              resetTimeline();
+              setSilentAlternate((current) => !current);
+              setActiveSetting(null);
+            }}
+          >
+            <span>静音</span>
+            <strong>{currentMeasureLabel}</strong>
+          </button>
+        </div>
+
+        {activeSetting === "bpm" && (
+          <label className="inline-editor">
+            <span>{bpm} BPM</span>
+            <input
+              type="range"
+              min="40"
+              max="180"
+              value={bpm}
+              onChange={(event) => {
+                resetTimeline();
+                setBpm(Number(event.target.value));
+              }}
+            />
+          </label>
+        )}
+
+        {activeSetting === "signature" && (
+          <div className="signature-editor" aria-label="选择拍号">
+            {SIGNATURE_OPTIONS.map((signature) => (
+              <button
+                type="button"
+                className={signatureValue === signature.label ? "is-selected" : ""}
+                key={signature.label}
+                onClick={() => updateSignature(signature.label)}
+              >
+                {signature.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="beat-panel" aria-label="节拍跟打">
+        <div
+          className={`beat-dots ${quizState === "active" ? "is-hidden" : ""}`}
+          aria-label="当前小节拍点"
+          aria-hidden={quizState === "active"}
+          style={{ "--beat-count": beatsPerMeasure } as CSSProperties}
+        >
+          {beatDots.map((dot) => {
+            const beatDotActive =
+              beatsPerMeasure === 1 ? clock.progress < 0.5 : clock.beatInMeasure === dot;
+
+            return <span key={dot} className={`beat-dot ${beatDotActive ? "is-active" : ""}`} />;
+          })}
+        </div>
+
+        <button
+          className={`drum-button ${tapPulseId ? "is-hit" : ""} ${drumLocked ? "is-locked" : ""}`}
+          type="button"
+          aria-disabled={drumLocked}
+          aria-label="敲击鼓面跟拍"
+          onPointerDown={registerTap}
+        >
+          <img src={drumPadSrc} alt="" draggable={false} />
+          {quizState === "listen" && <span className="listen-hint">先听一遍</span>}
+          {showIdleHint && !drumLocked && <span className="tap-hint">tap tap</span>}
+          {tapBubbles.map((bubble) => (
+            <span className={`tap-bubble ${bubble.quality}`} key={bubble.id}>
+              {bubble.label}
+            </span>
+          ))}
+          <span className="drum-ring" />
+        </button>
+
+        <span className={`sound-dot ${audioReady ? "is-ready" : ""}`} aria-label="声音状态" />
+      </section>
+
+      <section className="quiz-panel" aria-label="测验模式">
+        <div className="quiz-heading">
+          <div>
+            <p>测验</p>
+            <strong>{QUIZ_BEATS} 拍</strong>
+          </div>
+          <Timer size={21} />
+        </div>
+
+        <button
+          className="quiz-button"
+          type="button"
+          disabled={quizState === "active" || quizState === "countdown" || quizState === "listen"}
+          onClick={quizState === "done" ? startQuiz : startQuiz}
+        >
+          {quizButtonLabel}
+        </button>
+
+        <div
+          className={`quiz-progress ${quizState === "active" ? "is-hidden" : ""}`}
+          aria-hidden={quizState === "active"}
+          aria-label="测验进度"
+        >
+          <span style={{ "--quiz-progress": quizProgress } as CSSProperties} />
+        </div>
+
+        <div className="quiz-copy">
+          {quizState === "countdown"
+            ? "准备"
+            : quizState === "listen"
+              ? "听完这一小节再敲"
+            : quizState === "active"
+              ? `点击 ${quizTapCount}`
+              : quizState === "done"
+                ? "测验完成"
+                : "倒计时后记录"}
+        </div>
+      </section>
+
+      {quizState === "countdown" && (
+        <div className="countdown-overlay" aria-live="assertive" role="status">
+          <strong key={countdown}>{Math.max(countdown, 1)}</strong>
+        </div>
+      )}
+
+      {quizState === "done" && quizResult && quizResultCopy && (
+        <div className="result-overlay" role="dialog" aria-modal="true" aria-labelledby="result-title">
+          <section className="result-dialog">
+            <span className="result-badge">{quizResultCopy.badge}</span>
+            <strong className="result-score">{quizResult.accuracy}%</strong>
+            <h2 id="result-title">{quizResultCopy.title}</h2>
+            <p>{quizResultCopy.body}</p>
+            <div className="result-stats">
+              <span>命中 {quizResult.hits}/{quizResult.expected}</span>
+              <span>平均 {formatMs(quizResult.averageErrorMs)}</span>
+            </div>
+            <div className="result-actions">
+              <button className="result-primary" type="button" onClick={startQuiz}>
+                <RotateCcw size={17} />
+                再来一轮
+              </button>
+              <button className="result-secondary" type="button" onClick={clearResult}>
+                收下鼓励
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+    </main>
+  );
+}
