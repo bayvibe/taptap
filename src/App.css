@@ -481,7 +481,7 @@ input[type="range"] {
 .result-dialog {
   display: grid;
   width: min(100%, 382px);
-  gap: 13px;
+  gap: 14px;
   padding: 20px;
   border: 3px solid var(--ink);
   border-radius: 10px;
@@ -489,17 +489,6 @@ input[type="range"] {
   color: var(--ink);
   box-shadow: 10px 10px 0 var(--ink);
   animation: result-pop 360ms var(--ease-out);
-}
-
-.result-badge {
-  justify-self: start;
-  padding: 7px 11px;
-  border: 2px solid var(--ink);
-  border-radius: 999px;
-  background: color-mix(in oklch, var(--amber), white 42%);
-  font-size: 0.82rem;
-  font-weight: 950;
-  line-height: 1;
 }
 
 .result-score {
@@ -525,25 +514,37 @@ input[type="range"] {
 .result-stats {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  gap: 10px;
 }
 
 .result-stats span {
-  min-height: 48px;
-  padding: 10px;
-  border: 1px solid var(--line);
+  display: grid;
+  min-height: 78px;
+  align-content: center;
+  gap: 7px;
+  padding: 12px;
+  border: 2px solid var(--ink);
   border-radius: 8px;
-  background: var(--surface-deep);
+  background: color-mix(in oklch, var(--amber), white 58%);
   color: var(--ink);
-  font-size: 0.86rem;
-  font-weight: 950;
   line-height: 1.2;
+  box-shadow: 4px 4px 0 var(--ink);
+}
+
+.result-stats small {
+  color: var(--ink-soft);
+  font-size: 0.72rem;
+  font-weight: 950;
+}
+
+.result-stats strong {
+  font-size: clamp(1.55rem, 7vw, 2.05rem);
+  font-weight: 950;
+  line-height: 0.95;
 }
 
 .result-actions {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 9px;
 }
 
 .result-actions button {
@@ -561,11 +562,6 @@ input[type="range"] {
 .result-primary {
   background: var(--ink);
   color: var(--surface);
-}
-
-.result-secondary {
-  background: var(--surface-deep);
-  color: var(--ink);
 }
 
 @media (hover: hover) {

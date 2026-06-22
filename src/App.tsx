@@ -61,6 +61,7 @@ const SIGNATURE_OPTIONS = [
 const QUIZ_BEATS = 12;
 const COUNTDOWN_SECONDS = 3;
 const IDLE_HINT_MS = 5000;
+const FULL_SCORE_TOLERANCE_MS = 35;
 
 const INITIAL_CLOCK: ClockState = {
   beatIndex: 0,
@@ -93,35 +94,39 @@ const getBeatProfile = (beatIndex: number, config: PracticeConfig) => {
 };
 
 const playClick = (context: AudioContext, time: number, volume: number, accented = false) => {
-  const duration = accented ? 0.058 : 0.046;
+  const duration = accented ? 0.078 : 0.058;
   const sampleRate = context.sampleRate;
   const frameCount = Math.max(1, Math.floor(sampleRate * duration));
   const buffer = context.createBuffer(1, frameCount, sampleRate);
   const data = buffer.getChannelData(0);
   const source = context.createBufferSource();
   const gain = context.createGain();
-  const woodFrequency = accented ? 1180 : 1420;
-  const bodyFrequency = accented ? 520 : 720;
-  const edgeFrequency = accented ? 2360 : 2840;
+  const bodyStart = accented ? 360 : 520;
+  const bodyEnd = accented ? 180 : 320;
+  const rimFrequency = accented ? 1080 : 1320;
+  let bodyPhase = 0;
 
   for (let index = 0; index < frameCount; index += 1) {
     const t = index / sampleRate;
-    const attack = clamp(t / 0.0018, 0, 1);
-    const bodyEnvelope = Math.exp(-t * (accented ? 86 : 112));
-    const woodEnvelope = Math.exp(-t * 155);
-    const edgeEnvelope = Math.exp(-t * 240);
-    const strikeEnvelope = Math.exp(-t * 460);
-    const noise = Math.sin(index * 91.7 + 0.37) * Math.sin(index * 17.13 + 1.9);
-    const body = Math.sin(2 * Math.PI * bodyFrequency * t) * (accented ? 0.34 : 0.18) * bodyEnvelope;
-    const wood = Math.sin(2 * Math.PI * woodFrequency * t) * 0.68 * woodEnvelope;
-    const edge = Math.sin(2 * Math.PI * edgeFrequency * t) * 0.16 * edgeEnvelope;
-    const strike = noise * (accented ? 0.12 : 0.09) * strikeEnvelope;
+    const attack = clamp(t / 0.0024, 0, 1);
+    const sweep = Math.pow(bodyEnd / bodyStart, clamp(t / duration, 0, 1));
+    const bodyFrequency = bodyStart * sweep;
+    const bodyEnvelope = Math.exp(-t * (accented ? 42 : 58));
+    const rimEnvelope = Math.exp(-t * 135);
+    const noiseEnvelope = Math.exp(-t * 230);
+    const noise = Math.random() * 2 - 1;
 
-    data[index] = (body + wood + edge + strike) * attack;
+    bodyPhase += (2 * Math.PI * bodyFrequency) / sampleRate;
+
+    const body = Math.sin(bodyPhase) * (accented ? 0.72 : 0.46) * bodyEnvelope;
+    const rim = Math.sin(2 * Math.PI * rimFrequency * t) * 0.34 * rimEnvelope;
+    const strike = noise * (accented ? 0.22 : 0.16) * noiseEnvelope;
+
+    data[index] = (body + rim + strike) * attack;
   }
 
   source.buffer = buffer;
-  gain.gain.setValueAtTime(volume * (accented ? 0.7 : 0.54), time);
+  gain.gain.setValueAtTime(volume * (accented ? 0.78 : 0.58), time);
 
   source.connect(gain);
   gain.connect(context.destination);
@@ -170,34 +175,37 @@ const formatMs = (value: number | null) => {
 };
 
 const getQuizResultCopy = (result: QuizResult) => {
+  if (result.accuracy === 100) {
+    return {
+      title: "满分，节拍器刚才沉默了三秒",
+      body: "它可能在怀疑自己是不是被你反向校准了。可以加 BPM 了，别让它太舒服。",
+    };
+  }
+
   if (result.accuracy >= 90) {
     return {
-      badge: "稳到发光",
-      title: "这拍子被你拿捏住了",
-      body: "手感很在线，像是节拍已经住进手腕里。下一轮可以稍微加一点 BPM。",
+      title: "差一点满分，节拍器先眨眼了",
+      body: "已经非常稳，只差一点点把拍子钉在地板上。下一轮可以冲那个稀有的 100%。",
     };
   }
 
   if (result.accuracy >= 70) {
     return {
-      badge: "节奏上线",
-      title: "很不错，已经跟上主脉搏了",
-      body: "有几拍还在找位置，但整体很有方向。再听一遍重拍，下一轮会更稳。",
+      title: "节奏大巴基本赶上了",
+      body: "有几拍像在门口刷卡，但主脉搏已经在线。再来一轮，手腕会更听话。",
     };
   }
 
   if (result.accuracy >= 45) {
     return {
-      badge: "正在校准",
-      title: "别急，节拍感正在长出来",
-      body: "先别追求全中，盯住第一拍和最后一拍。身体记住以后，中间会自己排队。",
+      title: "拍子还在找自己的鞋",
+      body: "先别追全中，盯住第一拍。等脚穿对了，中间那些拍会自己排队进场。",
     };
   }
 
   return {
-    badge: "重新蓄力",
-    title: "这一轮是热身，不算输",
-    body: "建议把 BPM 降一点，只敲强拍也可以。稳住一个点，比乱追十二个点更有用。",
+    title: "这一轮像锅盖在跳舞",
+    body: "问题不大，锅盖也有节奏。把 BPM 降一点，只敲强拍，先抓住一个稳稳的点。",
   };
 };
 
@@ -221,12 +229,18 @@ const analyzeQuiz = (
 
   const bestTaps = Array.from(bestByTarget.values());
   const hits = bestTaps.filter((tap) => Math.abs(tap.errorMs) <= tolerance);
+  const rawAccuracy = Math.round((hits.length / expected) * 100);
+  const strictFullScore =
+    rawAccuracy === 100 &&
+    taps.length === expected &&
+    bestTaps.length === expected &&
+    bestTaps.every((tap) => Math.abs(tap.errorMs) <= FULL_SCORE_TOLERANCE_MS);
   const averageErrorMs = bestTaps.length
     ? bestTaps.reduce((sum, tap) => sum + tap.errorMs, 0) / bestTaps.length
     : null;
 
   return {
-    accuracy: Math.round((hits.length / expected) * 100),
+    accuracy: rawAccuracy === 100 && !strictFullScore ? 99 : rawAccuracy,
     hits: hits.length,
     expected,
     averageErrorMs,
@@ -658,11 +672,6 @@ export default function App() {
     setActiveSetting(null);
   };
 
-  const clearResult = () => {
-    setQuizResult(null);
-    cancelQuiz();
-  };
-
   const signatureValue = `${beatsPerMeasure}/${beatUnit}`;
   const beatDots = Array.from({ length: beatsPerMeasure }, (_, index) => index);
   const currentMeasureLabel = silentAlternate ? "开" : "关";
@@ -831,21 +840,25 @@ export default function App() {
       {quizState === "done" && quizResult && quizResultCopy && (
         <div className="result-overlay" role="dialog" aria-modal="true" aria-labelledby="result-title">
           <section className="result-dialog">
-            <span className="result-badge">{quizResultCopy.badge}</span>
             <strong className="result-score">{quizResult.accuracy}%</strong>
             <h2 id="result-title">{quizResultCopy.title}</h2>
             <p>{quizResultCopy.body}</p>
             <div className="result-stats">
-              <span>命中 {quizResult.hits}/{quizResult.expected}</span>
-              <span>平均 {formatMs(quizResult.averageErrorMs)}</span>
+              <span>
+                <small>命中</small>
+                <strong>
+                  {quizResult.hits}/{quizResult.expected}
+                </strong>
+              </span>
+              <span>
+                <small>平均误差</small>
+                <strong>{formatMs(quizResult.averageErrorMs)}</strong>
+              </span>
             </div>
             <div className="result-actions">
               <button className="result-primary" type="button" onClick={startQuiz}>
                 <RotateCcw size={17} />
                 再来一轮
-              </button>
-              <button className="result-secondary" type="button" onClick={clearResult}>
-                收下鼓励
               </button>
             </div>
           </section>
