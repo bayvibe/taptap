@@ -1,9 +1,10 @@
-import { RotateCcw, Timer } from "lucide-react";
+import { RotateCcw, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import drumPadSrc from "./assets/drum-pad-cutout.webp";
 
 type Quality = "perfect" | "fast" | "slow";
+type AppMode = "quiz" | "practice";
 type QuizState = "idle" | "countdown" | "listen" | "prep" | "active" | "done";
 type SettingPanel = "bpm" | "signature" | null;
 
@@ -62,6 +63,7 @@ const QUIZ_MEASURES = 5;
 const COUNTDOWN_SECONDS = 3;
 const IDLE_HINT_MS = 5000;
 const FULL_SCORE_TOLERANCE_MS = 35;
+const DRUM_PULSE_MS = 300;
 
 const INITIAL_CLOCK: ClockState = {
   beatIndex: 0,
@@ -82,6 +84,9 @@ const toleranceFor = (bpm: number) => {
 };
 
 const quizBeatCount = (config: PracticeConfig) => config.beatsPerMeasure * QUIZ_MEASURES;
+
+const shouldPauseBeat = (mode: AppMode, state: QuizState) =>
+  mode === "quiz" && (state === "idle" || state === "countdown" || state === "done");
 
 const getBeatProfile = (beatIndex: number, config: PracticeConfig) => {
   const measureIndex = Math.floor(beatIndex / config.beatsPerMeasure);
@@ -250,6 +255,7 @@ const analyzeQuiz = (
 };
 
 export default function App() {
+  const [mode, setMode] = useState<AppMode>("quiz");
   const [bpm, setBpm] = useState(60);
   const [beatsPerMeasure, setBeatsPerMeasure] = useState(4);
   const [beatUnit, setBeatUnit] = useState(4);
@@ -257,16 +263,14 @@ export default function App() {
   const [clock, setClock] = useState<ClockState>(INITIAL_CLOCK);
   const [tapBubbles, setTapBubbles] = useState<TapBubble[]>([]);
   const [tapPulseId, setTapPulseId] = useState<string | null>(null);
-  const [audioReady, setAudioReady] = useState(false);
   const [showIdleHint, setShowIdleHint] = useState(false);
   const [activeSetting, setActiveSetting] = useState<SettingPanel>(null);
   const [quizState, setQuizState] = useState<QuizState>("idle");
   const [countdown, setCountdown] = useState(COUNTDOWN_SECONDS);
-  const [quizProgress, setQuizProgress] = useState(0);
-  const [quizTapCount, setQuizTapCount] = useState(0);
   const [quizResult, setQuizResult] = useState<QuizResult | null>(null);
 
   const audioRef = useRef<AudioContext | null>(null);
+  const audioPrimedRef = useRef(false);
   const schedulerRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
   const nextBeatIndexRef = useRef(0);
@@ -278,6 +282,7 @@ export default function App() {
   const pageAudibleRef = useRef(
     typeof document === "undefined" ? true : document.visibilityState === "visible",
   );
+  const modeRef = useRef<AppMode>("quiz");
   const quizStateRef = useRef<QuizState>("idle");
   const quizListenEndBeatRef = useRef(0);
   const quizPrepEndBeatRef = useRef(0);
@@ -300,6 +305,10 @@ export default function App() {
   }, [config]);
 
   useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+
+  useEffect(() => {
     quizStateRef.current = quizState;
   }, [quizState]);
 
@@ -319,37 +328,28 @@ export default function App() {
         await audioRef.current.resume();
       }
       const running = audioRef.current.state === "running";
-      setAudioReady(running);
+
+      if (running && document.visibilityState === "visible") {
+        pageAudibleRef.current = true;
+      }
+
+      if (running && !audioPrimedRef.current) {
+        const buffer = audioRef.current.createBuffer(1, 1, audioRef.current.sampleRate);
+        const source = audioRef.current.createBufferSource();
+        const gain = audioRef.current.createGain();
+
+        source.buffer = buffer;
+        gain.gain.value = 0;
+        source.connect(gain);
+        gain.connect(audioRef.current.destination);
+        source.start(audioRef.current.currentTime);
+        audioPrimedRef.current = true;
+      }
+
       return running;
     } catch {
-      setAudioReady(false);
       return false;
     }
-  }, []);
-
-  const cancelQuiz = useCallback(() => {
-    quizListenEndBeatRef.current = 0;
-    quizPrepEndBeatRef.current = 0;
-    quizStartBeatRef.current = 0;
-    quizEndBeatRef.current = 0;
-    quizTapsRef.current = [];
-    setQuizTapCount(0);
-    setQuizProgress(0);
-    setCountdown(COUNTDOWN_SECONDS);
-    setQuizResult(null);
-    setQuizState("idle");
-  }, []);
-
-  const resetIdleHint = useCallback(() => {
-    setShowIdleHint(false);
-
-    if (idleTimerRef.current !== null) {
-      window.clearTimeout(idleTimerRef.current);
-    }
-
-    idleTimerRef.current = window.setTimeout(() => {
-      setShowIdleHint(true);
-    }, IDLE_HINT_MS);
   }, []);
 
   const clearScheduledClicks = useCallback(() => {
@@ -363,6 +363,32 @@ export default function App() {
     scheduledClicksRef.current = [];
   }, []);
 
+  const cancelQuiz = useCallback(() => {
+    quizStateRef.current = "idle";
+    quizListenEndBeatRef.current = 0;
+    quizPrepEndBeatRef.current = 0;
+    quizStartBeatRef.current = 0;
+    quizEndBeatRef.current = 0;
+    quizTapsRef.current = [];
+    setCountdown(COUNTDOWN_SECONDS);
+    setQuizResult(null);
+    setQuizState("idle");
+    clearScheduledClicks();
+    setClock(INITIAL_CLOCK);
+  }, [clearScheduledClicks]);
+
+  const resetIdleHint = useCallback(() => {
+    setShowIdleHint(false);
+
+    if (idleTimerRef.current !== null) {
+      window.clearTimeout(idleTimerRef.current);
+    }
+
+    idleTimerRef.current = window.setTimeout(() => {
+      setShowIdleHint(true);
+    }, IDLE_HINT_MS);
+  }, []);
+
   const resetTimeline = useCallback(() => {
     clearScheduledClicks();
     sessionStartRef.current = performance.now() / 1000;
@@ -371,6 +397,11 @@ export default function App() {
   }, [clearScheduledClicks]);
 
   const runScheduler = useCallback(() => {
+    if (shouldPauseBeat(modeRef.current, quizStateRef.current)) {
+      clearScheduledClicks();
+      return;
+    }
+
     const context = audioRef.current;
     const currentConfig = configRef.current;
     if (!pageAudibleRef.current || !context || !currentConfig || context.state !== "running") return;
@@ -401,9 +432,21 @@ export default function App() {
 
       nextBeatIndexRef.current += 1;
     }
-  }, []);
+  }, [clearScheduledClicks]);
+
+  const enableSound = useCallback(() => {
+    void unlockAudio().then((ready) => {
+      if (ready) runScheduler();
+    });
+  }, [runScheduler, unlockAudio]);
 
   const updateClock = useCallback(() => {
+    if (shouldPauseBeat(modeRef.current, quizStateRef.current)) {
+      setClock(INITIAL_CLOCK);
+      rafRef.current = window.requestAnimationFrame(updateClock);
+      return;
+    }
+
     const currentConfig = configRef.current;
     if (!currentConfig) return;
 
@@ -435,9 +478,8 @@ export default function App() {
     quizStartBeatRef.current = firstQuizBeat;
     quizEndBeatRef.current = firstQuizBeat + quizBeatCount(currentConfig);
     quizTapsRef.current = [];
-    setQuizTapCount(0);
-    setQuizProgress(0);
     setQuizResult(null);
+    quizStateRef.current = "active";
     setQuizState("active");
   }, []);
 
@@ -451,9 +493,8 @@ export default function App() {
     quizStartBeatRef.current = 0;
     quizEndBeatRef.current = 0;
     quizTapsRef.current = [];
-    setQuizTapCount(0);
-    setQuizProgress(0);
     setQuizResult(null);
+    quizStateRef.current = "listen";
     setQuizState("listen");
   }, [resetTimeline]);
 
@@ -469,45 +510,72 @@ export default function App() {
     );
 
     setQuizResult(result);
-    setQuizProgress(1);
+    quizStateRef.current = "done";
+    clearScheduledClicks();
+    setClock(INITIAL_CLOCK);
     setQuizState("done");
-  }, []);
+  }, [clearScheduledClicks]);
 
   const startQuiz = useCallback(() => {
-    void unlockAudio();
+    modeRef.current = "quiz";
+    setMode("quiz");
+    quizStateRef.current = "countdown";
+    clearScheduledClicks();
+    setClock(INITIAL_CLOCK);
     resetIdleHint();
     quizListenEndBeatRef.current = 0;
     quizPrepEndBeatRef.current = 0;
     quizStartBeatRef.current = 0;
     quizEndBeatRef.current = 0;
     quizTapsRef.current = [];
-    setQuizTapCount(0);
-    setQuizProgress(0);
     setQuizResult(null);
     setCountdown(COUNTDOWN_SECONDS);
     setQuizState("countdown");
-  }, [resetIdleHint, unlockAudio]);
+    enableSound();
+  }, [clearScheduledClicks, enableSound, resetIdleHint]);
+
+  const enterQuizMode = useCallback(() => {
+    modeRef.current = "quiz";
+    setMode("quiz");
+    setActiveSetting(null);
+    setTapBubbles([]);
+    setTapPulseId(null);
+    cancelQuiz();
+  }, [cancelQuiz]);
+
+  const enterPracticeMode = useCallback(() => {
+    modeRef.current = "practice";
+    setMode("practice");
+    setActiveSetting(null);
+    setTapBubbles([]);
+    setTapPulseId(null);
+    cancelQuiz();
+    resetTimeline();
+    enableSound();
+  }, [cancelQuiz, enableSound, resetTimeline]);
 
   const registerTap = useCallback(() => {
-    void unlockAudio();
+    enableSound();
     resetIdleHint();
 
     const currentConfig = configRef.current;
     if (!currentConfig) return;
 
     if (
-      quizStateRef.current === "countdown" ||
-      quizStateRef.current === "listen" ||
-      quizStateRef.current === "prep"
+      modeRef.current === "quiz" &&
+      (quizStateRef.current === "idle" ||
+        quizStateRef.current === "countdown" ||
+        quizStateRef.current === "listen" ||
+        quizStateRef.current === "done")
     ) {
       const waitBubble: TapBubble = {
         id: `wait-${Date.now()}`,
         quality: "slow",
         label:
-          quizStateRef.current === "countdown"
-            ? "等等"
-            : quizStateRef.current === "prep"
-              ? "预备"
+          quizStateRef.current === "idle" || quizStateRef.current === "done"
+            ? "点开始"
+            : quizStateRef.current === "countdown"
+              ? "等等"
               : "先听",
       };
       setTapBubbles((current) => [...current.slice(-2), waitBubble]);
@@ -544,7 +612,7 @@ export default function App() {
     setTapPulseId(record.id);
     window.setTimeout(() => {
       setTapPulseId((current) => (current === record.id ? null : current));
-    }, 170);
+    }, DRUM_PULSE_MS);
     window.setTimeout(() => {
       setTapBubbles((current) => current.filter((item) => item.id !== bubble.id));
     }, 1800);
@@ -555,13 +623,32 @@ export default function App() {
       targetIndex < quizEndBeatRef.current
     ) {
       quizTapsRef.current = [...quizTapsRef.current, record];
-      setQuizTapCount(quizTapsRef.current.length);
     }
-  }, [resetIdleHint, unlockAudio]);
+  }, [enableSound, resetIdleHint]);
+
+  useEffect(() => {
+    window.addEventListener("pointerdown", enableSound, { passive: true });
+    window.addEventListener("touchstart", enableSound, { passive: true });
+    window.addEventListener("keydown", enableSound);
+
+    return () => {
+      window.removeEventListener("pointerdown", enableSound);
+      window.removeEventListener("touchstart", enableSound);
+      window.removeEventListener("keydown", enableSound);
+    };
+  }, [enableSound]);
 
   useEffect(() => {
     resetTimeline();
-    void unlockAudio();
+    if (!shouldPauseBeat(modeRef.current, quizStateRef.current)) {
+      enableSound();
+    }
+
+    const audioKickTimer = window.setTimeout(() => {
+      if (!shouldPauseBeat(modeRef.current, quizStateRef.current)) {
+        enableSound();
+      }
+    }, 120);
     resetIdleHint();
 
     schedulerRef.current = window.setInterval(runScheduler, 25);
@@ -583,8 +670,16 @@ export default function App() {
       }
 
       clearScheduledClicks();
+      window.clearTimeout(audioKickTimer);
     };
-  }, [clearScheduledClicks, resetIdleHint, resetTimeline, runScheduler, unlockAudio, updateClock]);
+  }, [
+    clearScheduledClicks,
+    enableSound,
+    resetIdleHint,
+    resetTimeline,
+    runScheduler,
+    updateClock,
+  ]);
 
   useEffect(() => {
     const setPageAudible = (audible: boolean) => {
@@ -597,27 +692,27 @@ export default function App() {
         return;
       }
 
-      void unlockAudio();
+      enableSound();
     };
 
     const syncPageAudibility = () => {
-      setPageAudible(document.visibilityState === "visible" && document.hasFocus());
+      setPageAudible(document.visibilityState === "visible");
     };
     const mutePage = () => setPageAudible(false);
 
     syncPageAudibility();
     document.addEventListener("visibilitychange", syncPageAudibility);
     window.addEventListener("focus", syncPageAudibility);
-    window.addEventListener("blur", mutePage);
+    window.addEventListener("pageshow", syncPageAudibility);
     window.addEventListener("pagehide", mutePage);
 
     return () => {
       document.removeEventListener("visibilitychange", syncPageAudibility);
       window.removeEventListener("focus", syncPageAudibility);
-      window.removeEventListener("blur", mutePage);
+      window.removeEventListener("pageshow", syncPageAudibility);
       window.removeEventListener("pagehide", mutePage);
     };
-  }, [clearScheduledClicks, unlockAudio]);
+  }, [clearScheduledClicks, enableSound]);
 
   useEffect(() => {
     resetTimeline();
@@ -659,36 +754,21 @@ export default function App() {
   useEffect(() => {
     if (quizState !== "listen") return;
 
-    const listenBeats = Math.max(1, quizListenEndBeatRef.current);
-    const listenProgress = clamp((clock.beatIndex + clock.progress) / listenBeats, 0, 1);
-    setQuizProgress(listenProgress);
-
     if (quizListenEndBeatRef.current > 0 && clock.beatIndex >= quizListenEndBeatRef.current) {
       setQuizState("prep");
     }
-  }, [clock.beatIndex, clock.progress, quizState]);
+  }, [clock.beatIndex, quizState]);
 
   useEffect(() => {
     if (quizState !== "prep") return;
 
-    const prepEndBeat = Math.max(1, quizPrepEndBeatRef.current);
-    const prepProgress = clamp((clock.beatIndex + clock.progress) / prepEndBeat, 0, 1);
-    setQuizProgress(prepProgress);
-
     if (quizPrepEndBeatRef.current > 0 && clock.beatIndex >= quizPrepEndBeatRef.current) {
       activateQuiz(quizPrepEndBeatRef.current);
     }
-  }, [activateQuiz, clock.beatIndex, clock.progress, quizState]);
+  }, [activateQuiz, clock.beatIndex, quizState]);
 
   useEffect(() => {
     if (quizState !== "active") return;
-
-    const currentConfig = configRef.current;
-    if (!currentConfig) return;
-
-    const expectedBeats = quizBeatCount(currentConfig);
-    const completedBeats = clamp(clock.beatIndex - quizStartBeatRef.current + 1, 0, expectedBeats);
-    setQuizProgress(completedBeats / expectedBeats);
 
     if (quizEndBeatRef.current > 0 && clock.beatIndex >= quizEndBeatRef.current) {
       finishQuiz();
@@ -707,26 +787,53 @@ export default function App() {
   const beatDots = Array.from({ length: beatsPerMeasure }, (_, index) => index);
   const currentMeasureLabel = silentAlternate ? "开" : "关";
   const expectedQuizBeats = quizBeatCount(config);
-  const quizVisualHidden = quizState === "prep" || quizState === "active";
-  const drumLocked = quizState === "listen" || quizState === "prep" || quizState === "countdown";
+  const quizVisualHidden = mode === "quiz" && quizState === "active";
+  const drumLocked =
+    mode === "quiz" &&
+    (quizState === "idle" ||
+      quizState === "listen" ||
+      quizState === "countdown" ||
+      quizState === "done");
   const quizButtonLabel =
     quizState === "active"
-      ? "测验中"
+      ? "测试中"
       : quizState === "prep"
         ? "预备"
       : quizState === "listen"
         ? "听一遍"
-        : quizState === "countdown"
+      : quizState === "countdown"
         ? "倒计时"
-        : quizState === "done"
-          ? "再测一次"
-          : "开始测验";
+      : quizState === "done"
+        ? "再测一次"
+        : "测一测你的节奏感";
   const quizResultCopy = quizResult ? getQuizResultCopy(quizResult) : null;
 
   return (
     <main className="mobile-shell">
+      <nav className="mode-switch" aria-label="练习入口">
+        <button
+          className={mode === "quiz" ? "is-selected" : ""}
+          type="button"
+          aria-pressed={mode === "quiz"}
+          onClick={() => {
+            if (mode !== "quiz") enterQuizMode();
+          }}
+        >
+          测试模式
+        </button>
+        <button
+          className={mode === "practice" ? "is-selected" : ""}
+          type="button"
+          aria-pressed={mode === "practice"}
+          onClick={() => {
+            if (mode !== "practice") enterPracticeMode();
+          }}
+        >
+          自由练习
+        </button>
+      </nav>
+
       <section className="status-hero" aria-label="当前节拍状态">
-        <p>拍感练习</p>
         <div className="status-grid">
           <button
             className={activeSetting === "bpm" ? "is-editing" : ""}
@@ -826,66 +933,45 @@ export default function App() {
           <span className="drum-ring" />
         </button>
 
-        <span className={`sound-dot ${audioReady ? "is-ready" : ""}`} aria-label="声音状态" />
+        {mode === "quiz" && (
+          <section className="quiz-panel" aria-label="测验模式">
+            <button
+              className="quiz-button"
+              type="button"
+              disabled={
+                quizState === "active" ||
+                quizState === "countdown" ||
+                quizState === "listen" ||
+                quizState === "prep"
+              }
+              onClick={startQuiz}
+            >
+              {quizButtonLabel}
+            </button>
+            <p className="quiz-meta">
+              {QUIZ_MEASURES}小节·{expectedQuizBeats}拍
+            </p>
+          </section>
+        )}
       </section>
 
-      <section className="quiz-panel" aria-label="测验模式">
-        <div className="quiz-heading">
-          <div>
-            <p>测验</p>
-            <strong>
-              {QUIZ_MEASURES} 小节 · {expectedQuizBeats} 拍
-            </strong>
-          </div>
-          <Timer size={21} />
-        </div>
-
-        <button
-          className="quiz-button"
-          type="button"
-          disabled={
-            quizState === "active" ||
-            quizState === "countdown" ||
-            quizState === "listen" ||
-            quizState === "prep"
-          }
-          onClick={quizState === "done" ? startQuiz : startQuiz}
-        >
-          {quizButtonLabel}
-        </button>
-
-        <div
-          className={`quiz-progress ${quizState === "active" ? "is-hidden" : ""}`}
-          aria-hidden={quizState === "active"}
-          aria-label="测验进度"
-        >
-          <span style={{ "--quiz-progress": quizProgress } as CSSProperties} />
-        </div>
-
-        <div className="quiz-copy">
-          {quizState === "countdown"
-            ? "准备"
-            : quizState === "listen"
-              ? "听完这一小节"
-            : quizState === "prep"
-              ? "预备拍不计分，下一小节开始"
-            : quizState === "active"
-              ? `点击 ${quizTapCount}`
-              : quizState === "done"
-                ? "测验完成"
-                : "倒计时后记录"}
-        </div>
-      </section>
-
-      {quizState === "countdown" && (
+      {mode === "quiz" && quizState === "countdown" && (
         <div className="countdown-overlay" aria-live="assertive" role="status">
           <strong key={countdown}>{Math.max(countdown, 1)}</strong>
         </div>
       )}
 
-      {quizState === "done" && quizResult && quizResultCopy && (
+      {mode === "quiz" && quizState === "done" && quizResult && quizResultCopy && (
         <div className="result-overlay" role="dialog" aria-modal="true" aria-labelledby="result-title">
           <section className="result-dialog">
+            <button
+              className="result-close"
+              type="button"
+              aria-label="关闭结果"
+              onClick={cancelQuiz}
+            >
+              <X size={18} />
+            </button>
             <strong className="result-score">{quizResult.accuracy}%</strong>
             <h2 id="result-title">{quizResultCopy.title}</h2>
             <p>{quizResultCopy.body}</p>
